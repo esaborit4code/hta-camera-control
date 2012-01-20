@@ -1,0 +1,1413 @@
+<html>
+
+<head>
+<title>DIYPhotoBits.com Camera Control 5.1 dev</title>
+
+<HTA:APPLICATION
+  APPLICATIONNAME="CameraControl"
+  ID="objCameraControl"
+  SINGLEINSTANCE="yes"
+  WINDOWSTATE="maximize"/>
+<link rel="stylesheet" type="text/css" href="style.css">
+</head>
+
+<script language="VBScript">
+
+
+Option Explicit
+
+' global defs
+
+Const wiaCommandTakePicture = "{AF933CAC-ACAD-11D2-A093-00C04F72DC3C}"
+Const wiaCommandSynchronize = "{9B26B7B2-ACAD-11D2-A093-00C04F72DC3C}"
+Const wiaCameraDeviceType = 2
+Const tickSize = 500
+
+Const HKEY_LOCAL_MACHINE = &H80000002
+Const HKEY_CURRENT_USER  = &H80000001
+const REG_SZ = 1
+const REG_EXPAND_SZ = 2
+const REG_BINARY = 3
+const REG_DWORD = 4
+const REG_MULTI_SZ = 7
+
+Dim outputfolder
+Dim DevMan
+Dim dlg
+Dim dev 'As WIA.Device
+dim okB ' as integer
+dim ynB ' as integer
+dim devInited '
+Dim ContinuousTether
+dim WshShell , fso
+dim afile
+dim colEnvVars 
+Dim tempfolder, foldername
+Dim DevicesConnectedCount
+
+Dim timerID
+
+Dim imgFormat
+
+Dim highestDownloadedItemNumber
+
+Dim tickno, Pushtick	
+dim TimelapseActive 
+dim nextTimeLapseShot
+Dim TimeLapseShots
+Dim mostRecentJPGFileName
+
+Dim FullScreenPreviewWindow
+Dim FullScreenPreviewVisible
+Dim FullScreenPreviewDIV
+
+
+'Dim cbDownloadImmediatelySaved
+
+Dim dicShutterTable
+'Dim dicExpCompTable ' populated but not used yet, this is a mistake as it is preventing it from working in Vista I think
+Dim dicWBTable
+
+Dim arExpCompTable(31) ' no idea the maximum but 5 stops each direction in thirds seems reasonable
+Dim arShutterTable(106) ' max is 53 on the D40 so I'm going for double to be safe
+
+Dim BlockTether
+
+' Camera Capabilities
+Dim ExposureModeAdjustable
+Dim ExposureTimeSubtypesValues
+Dim ExposureISOSubtypeValues
+'Dim ExposureCompensationSubtypeValues
+
+
+Dim currentPreview
+
+' subs start here
+
+
+Sub StartTimeLapse
+	TimelapseActive = True
+	TimeLapseShots = 0
+	' nextTimeLapseShot = tickno + (CInt(tbFrequencyInSeconds.value) * (1000 / tickSize))
+	nextTimeLapseShot = tickno  + (CInt(tbDelayBeforeStarting.value) * (1000 / tickSize))
+	
+	btStartTimeLapse.disabled = True
+	btStopTimeLapse.disabled = False
+end sub
+
+sub StopTimeLapse
+	TimelapseActive = false
+
+	btStartTimeLapse.disabled = False
+	btStopTimeLapse.disabled = True
+end sub
+
+
+Sub registrySaveSetting(SettingName,SettingValue)
+Dim objReg
+Dim OurKeyExists
+Dim arrSubKeys
+Dim objSubKey
+ 
+	'MsgBox "Save " + SettingName + SettingValue
+	Set objReg=GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv")
+	objReg.EnumKey HKEY_CURRENT_USER, "Software", arrSubKeys
+	OurKeyExists = False
+	
+	For Each objSubKey In arrSubKeys
+	   If objSubKey = "DIYPhotobits.com" Then
+	      OurKeyExists = True
+	      Exit For	   
+	   End If
+	Next
+	
+	If Not OurKeyExists Then
+		objReg.CreateKey HKEY_CURRENT_USER, "Software\DIYPhotobits.com"
+	End If	
+    
+	objReg.SetStringValue HKEY_CURRENT_USER,"Software\DIYPhotobits.com",SettingName,SettingValue 
+
+	
+End sub
+
+Function RegistryGetSetting(SettingName)
+Dim objReg
+Dim OurKeyExists
+Dim ourValue
+Dim arrSubKeys
+Dim objSubKey
+Dim arrValues
+Dim objValue
+Dim OurValueExists
+
+	Set objReg=GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv")
+	objReg.EnumKey HKEY_CURRENT_USER, "Software", arrSubKeys
+	OurKeyExists = False
+	
+	For Each objSubKey In arrSubKeys
+	   If objSubKey = "DIYPhotobits.com" Then
+	      OurKeyExists = True
+	      Exit For	   
+	   End If
+	Next
+	
+	If  OurKeyExists Then
+		' MsgBox "our key exists"
+		' our key exists, now check if the required value exists
+	
+		' Get an array of all the values in this key
+		objReg.EnumValues HKEY_CURRENT_USER, "Software\DIYPhotobits.com", arrValues
+		
+		' spin through the array (actually it is a collection) to see if our settings i there
+		OurValueExists = False
+		For each objValue In arrValues
+			If objValue = SettingName Then
+				OurValueExists = True
+				Exit For
+			End If
+		Next	
+		
+		If OurValueExists Then
+			' it is there, so get the content		
+		'	 MsgBox "our value exists " + settingname
+			objReg.GetStringValue HKEY_CURRENT_USER,"Software\DIYPhotobits.com",SettingName,ourValue 
+			RegistryGetSetting = ourValue
+			'MsgBox "got our value it is " + ourValue			
+		Else
+			' it is not there, so return a blank string because I don't like null
+		'	MsgBox "registry value does not exist " + SettingsName
+			RegistryGetSetting = ""			
+		End If		
+		
+	Else 
+		RegistryGetSetting = ""
+		'MsgBox "empty string"
+	End If	
+
+End function
+
+Function downloadOne(itemnumber)
+	Dim objOption
+	Dim img
+	Dim fn, fnext, tempfn, originalfn
+	Dim RunReturnCode
+	
+	fn = ""
+	If dev.items.count >= itemnumber Then
+		Set img = dlg.ShowTransfer(dev.Items(itemnumber))
+		fnext = img.FileExtension
+		If fnext = "" Then ' annoying piece of hard coding to allow for nef/raw support, at least on XP WIA will download a raw, but fails to show any file name ext.
+		       fnext = "NEF"
+		End If
+
+		originalfn = dev.Items(itemnumber).Properties("Item Name").Value
+		'tempfn = outputfolder & "temp\" & dev.Items(itemnumber).Properties("Item Name").Value & "." & fnext
+		tempfn = outputfolder & originalfn & "." & fnext & ".tmp"
+	    fn =outputfolder  & txtFileNamePrefix.value & dev.Items(itemnumber).Properties("Item Name").Value & "." & fnext
+		img.SaveFile tempfn 
+	    img = null
+		Set aFile = fso.GetFile(tempfn )
+		aFile.Move fn 
+		if UCase(fnext) = "JPG" Then
+			mostRecentJPGFileName = fn
+		End If 
+		highestDownloadedItemNumber = itemnumber ' i'm keeping track of this as I hope to be able to reconnect if the cable is dropped later
+	End If
+	
+	' any file downloaded needs to be added to the list of files downloaded
+	
+    set objOption = document.createElement("option") 
+    objOption.text = LCase(txtFileNamePrefix.value + originalfn + "." + fnext)
+    objOption.value = fn 
+    slFileList.options.add(objOption) 
+	
+	' Now do post processing
+	If cbPostProcess.checked Then
+   		RunReturnCode = DoPostProcessing(fn)
+   	End If
+	downloadOne = fn
+End Function
+
+Sub fnShutterRelease
+	Dim itemCount
+	Dim downloadedfilename
+	Dim convertedpath
+	Dim WaitTimeout
+	Dim ShotsToTake
+	Dim CurrentExpoCompOffset
+	Dim CurrentExpoComp
+	Dim CurrentExposureTimeOffset, CurrentExposureTime
+	Dim i
+
+	if devInited = 1 Then
+	
+'		' prevent the tick processor from even trying to do downloads while we are forcing a remote shutter release
+		BlockTether = true
+    	
+		itemCount = dev.Items.Count
+
+		ShotsToTake = 1
+		'MsgBox cbBracket.checked
+		If cbBracket.checked Then
+			ShotsToTake = (CInt(tbBracketShots.value) + 1)
+			'MsgBox ShotsToTake
+			
+			If dev.properties("Exposure Mode").Value <> 1 Then ' not manual mode, so we can use exposure compensation for bracketing
+
+				CurrentExpoComp = dev.properties("Exposure Compensation").value          
+				For i = 1 To 31 
+					If CurrentExpoComp = arExpCompTable(i) Then
+						CurrentExpoCompOffset = i	
+						Exit for
+					End If
+				Next
+				'MsgBox CurrentExpoCompOffset	
+			Else
+				' work out the current shutter value
+				CurrentExposureTime = dev.properties("Exposure Time").value          
+				For i = 1 To 106 
+					If CurrentExposureTime = arShutterTable(i) Then
+						CurrentExposureTimeOffset = i	
+						'MsgBox CurrentExposureTimeOffset
+						'MsgBox CurrentExposureTime
+						Exit for
+					End If
+				Next				
+			End If
+			
+			
+		End If
+		
+		Err.Clear		
+		On Error Resume Next
+		Do While ShotsToTake > 0
+			dev.ExecuteCommand (wiaCommandTakePicture)
+			ShotsToTake = ShotsToTake  - 1
+			If dev.properties("Exposure Mode").Value <> 1 Then ' not manual mode, so we can use exposure compensation for bracketing			
+				If cbBracket.checked Then ' bracketing is on so have to adjust expo comp
+	'				MsgBox (((int((ShotsToTake-1)/2) + 1) * CInt(tbBracketStops.value)) * 3)
+					If abs(ShotsToTake) mod 2 = 1 Then ' odd vs even
+						dev.properties("Exposure Compensation").Value = arExpCompTable (CurrentExpoCompOffset+Round((((int((ShotsToTake-1)/2) + 1) * Cdbl(tbBracketStops.value)) * 3)))
+					Else
+						dev.properties("Exposure Compensation").Value = arExpCompTable (CurrentExpoCompOffset-Round((((int((ShotsToTake-1)/2) + 1) * Cdbl(tbBracketStops.value)) * 3)))
+					End If
+				End If
+			Else
+				' do it by varying the shutter instead
+				If cbBracket.checked Then ' bracketing is on and it is manual mode so have to adjust the shutter
+					' we don't try to adjust the ap as this would change dof which typically people don't
+					' want to do while doing bracketing
+					'MsgBox "Adjust exposure time"
+					'MsgBox CurrentExposureTimeOffset+Round((((int((ShotsToTake-1)/2) + 1) * Cdbl(tbBracketStops.value)) * 3))
+					If abs(ShotsToTake) mod 2 = 1 Then ' odd vs even
+						'MsgBox "+"
+						dev.properties("Exposure Time").Value = arShutterTable (CurrentExposureTimeOffset+Round((((int((ShotsToTake-1)/2) + 1) * Cdbl(tbBracketStops.value)) * 3)))
+					Else
+						'MsgBox "-"
+						dev.properties("Exposure Time").Value = arShutterTable (CurrentExposureTimeOffset-Round((((int((ShotsToTake-1)/2) + 1) * Cdbl(tbBracketStops.value)) * 3)))
+					End If
+					'MsgBox dev.Properties("Exposure Time")
+				End If
+				
+			End If
+			
+		Loop 
+		On Error Goto 0 
+		If dev.properties("Exposure Mode").Value <> 1 Then ' not manual mode, so we can use exposure compensation for bracketing					
+			If cbBracket.checked Then 
+				' reset exposure comp after bracketing
+				dev.properties("Exposure Compensation").value = CurrentExpoComp 
+			End If
+		Else
+			' reset the shutter
+			If cbBracket.checked Then 
+				' reset eshutter after bracketing in manual mode
+				dev.properties("Exposure Time").value = CurrentExposureTime
+			End If
+		End If
+		
+	     
+		BlockTether = false
+       	
+    End if
+End Sub
+
+Sub fnExposureISOChange
+'	MsgBox dev.properties("Exposure Index").value
+	dev.properties("Exposure Index").value = Clng(ddExposureISO.value)
+End Sub
+
+Sub fnApertureChange
+	dev.properties("F Number").value = CLng(ddAperture.value)
+End Sub
+Sub fnExposureTimeChange
+	dev.properties("Exposure Time").value = CLng(ddExposureTime.value)
+End Sub
+
+
+Sub fnExposureCompensationChange
+	dev.properties("Exposure Compensation").value = Clng(ddExposureCompensation.value)
+End Sub
+
+
+Sub fnWhiteBalanceChange
+	dev.properties("White Balance").value = Clng(ddWhiteBalance.value)
+End Sub
+
+Sub SetUpFnumberGUI
+Dim x
+Dim elm
+	
+	If Not dev.properties("F Number").isreadonly Then
+		x = "Aperture: <select id=slAperture onchange=fnApertureChange size=1 name=ddAperture>"
+		For Each elm In dev.properties("F Number").Subtypevalues
+			If dev.properties("F Number").value = elm Then
+				x = x +"<option value="""+CStr( elm)+""" selected>f/"+CStr( elm/100)+"</option>"
+			Else
+				x = x +"<option value="+CStr( elm)+">f/"+CStr( elm/100)+"</option>"
+			End If
+			
+		Next
+		x = x + "</select>"
+		spAperture.innerhtml = x
+	Else 
+'		spAperture.innerhtml = "Aperture: <i>n/a</i>"
+		spAperture.disabled = True
+		slAperture.disabled = true		
+	End if
+End Sub
+
+Sub SetUpExposureTimeGUI
+Dim x, i
+Dim elm
+
+'	MsgBox "SetUpExposureTimeGUI dev.properties(Exposure Time).isreadonly = " & dev.properties("Exposure Time").isreadonly
+	'stop
+	If Not dev.properties("Exposure Time").isreadonly Then
+		x = "Shutter: <select id=slExposureTime onchange=fnExposureTimeChange size=1 name=ddExposureTime>"
+		i = 1
+		For Each elm In dev.properties("Exposure Time").Subtypevalues
+			If dev.properties("Exposure Time").value = elm Then
+				x = x +"<option value="""+CStr( elm)+""" selected>"+dicShutterTable.item( elm)+"</option>"
+			Else
+				x = x +"<option value="+CStr( elm)+">"+dicShutterTable.item( elm)+"</option>"
+			End If
+			arShutterTable(i) = elm
+			i = i + 1	
+		Next
+		x = x + "</select>"
+		spExposureTime.innerhtml = x
+
+	Else 
+	'	spExposureTime.innerhtml = "Shutter: <i>n/a</i>"
+		spExposureTime.disabled = True 
+		slExposureTime.disabled = True 
+	End If
+End Sub
+
+Sub SetUpExposureGUI
+Dim x 
+Dim elm
+
+	If Not ExposureModeAdjustable Then
+		spExposureMode.innerhtml = "Exposure mode: <i>Dial</i> &nbsp&nbsp&nbsp&nbsp  "
+	Else
+		spExposureMode.innerhtml = "Exposure mode: <select id=slExposureMode onchange=fnExposureModeChange size=1 name=ddExposureMode>	<option value=1>M</option>	<option value=2>P</option> <option value=3>A</option>	<option value=4>S</option>	</select>"
+		ddExposureMode.value = dev.properties("Exposure Mode").value
+
+	End If
+	
+
+	If Not dev.properties("Exposure Index").isreadonly Then
+		x = "ISO: <select id=slExposureISO onchange=fnExposureISOChange size=1 name=ddExposureISO>"
+		For Each elm In dev.properties("Exposure Index").Subtypevalues
+			If dev.properties("Exposure Index").value = elm Then
+				x = x +"<option value="""+CStr( elm)+""" selected>"+CStr( elm)+"</option>"
+			Else
+				x = x +"<option value="+CStr( elm)+">"+CStr( elm)+"</option>"
+			End If
+		Next
+		x = x + "</select>"
+		spExposureISO.innerhtml = x
+	Else
+	'	spExposureISO.innerhtml = "<i>n/a</i>"
+	End If
+	
+	If Not dev.properties("Exposure Compensation").isreadonly Then
+	
+		
+		x = "Exposure Compensation: <select id=slExposureCompensation onchange=fnExposureCompensationChange size=1 name=ddExposureCompensation>"
+
+		For Each elm In dev.properties("Exposure Compensation").SubTypeValues
+		
+			If elm = dev.properties("Exposure Compensation").value Then
+				x = x +"<option value=""" + CStr( elm) + """ selected>"
+			Else
+				x = x +"<option value=" + CStr( elm) + ">"
+			End If
+			
+			' Is this what is breaking vista?  they say negative expo comp is done differently for vista
+			' and I guess this part doesn't work the same
+			If elm > 32768 Then
+				x = x + cstr( Round((elm - 65536) / 1000,1) )
+			Else
+				x = x + cstr( Round(elm / 1000,1) )
+			End If
+		
+			x = x +"</option>"
+			
+		Next
+		x = x + "</select>"
+	
+		spExposureCompensation.innerhtml = x
+	Else
+	'	spExposureCompensation.innerhtml = "<i>n/a</i>"
+	End If
+	
+		
+	If Not dev.properties("White Balance").isreadonly Then
+		x = "White Balance: <select id=slWhiteBalance onchange=fnWhiteBalanceChange size=1 name=ddWhiteBalance>"
+		For Each elm In dev.properties("White Balance").Subtypevalues
+			If dev.properties("White Balance").value = elm Then
+				x = x +"<option value="""+CStr( elm)+""" selected>"+dicWBTable( elm)+"</option>"
+			Else
+				x = x +"<option value="+CStr( elm)+">"+dicWBTable( elm)+"</option>"
+			End If
+		Next
+		x = x + "</select>"
+		spWhiteBalance.innerhtml = x
+	Else
+	'	spWhiteBalance.innerhtml = "<i>n/a</i>"
+	End if
+	'MsgBox dev.properties("Exposure Mode").value
+	
+	SetUpFnumberGUI	
+	SetUpExposureTimeGUI
+	
+	Select Case dev.properties("Exposure Mode").value
+		Case 1 ' M
+			
+			'SetUpFnumberGUI	
+			'SetUpExposureTimeGUI
+			
+			spExposureTime.disabled = false		
+			spAperture.disabled = false	
+			slExposureTime.disabled = false		
+			slAperture.disabled = false	
+	
+		Case 2 ' P
+			spAperture.disabled = True 
+			spExposureTime.disabled = True 
+			slAperture.disabled = True 
+			slExposureTime.disabled = True 
+
+	
+		Case 3 ' A
+			
+			'SetUpFnumberGUI
+			'SetUpExposureTimeGUI
+			
+			spExposureTime.disabled = True
+			spAperture.disabled = False 
+			slExposureTime.disabled = True
+			slAperture.disabled = False 
+
+
+		Case 4 ' S
+
+			'SetUpExposureTimeGUI
+			
+			spExposureTime.disabled = False
+			spAperture.disabled = True 
+			slExposureTime.disabled = False
+			slAperture.disabled = True 
+
+
+	End Select
+		
+
+End sub
+
+Sub DeviceSelected
+	Dim originalMode
+	Dim originalDevice
+	Dim elm
+	Dim i
+
+
+
+	devInited = 1
+	'btStartContinuousTether.disabled = False
+	
+	devicename.innerHTML = "Camera connected: " + dev.Properties("Description").Value ' + " (" + CStr(dev.Properties("Pictures Taken").Value) + ")"
+	
+	highestDownloadedItemNumber = dev.Items.Count
+	If Not testCollection(dev.Commands, "Take a new picture") Then
+		MsgBox "This device may not support shutter release from the computer, "&vbNewLine &"use camera shutter button if onscreen button does not work", vbExclamation
+	End If
+
+	if imgformat = "jpg" then'
+		setjpg
+	end if
+	if imgformat = "raw" then
+		setraw
+	end If
+	
+'   used to have a dictionary here but now just use the array
+'   we need an array as we need to be able to walk up and down it to increase or decrease
+'   exposure comp
+
+	i = 1
+	For Each elm In dev.properties("Exposure Compensation").SubTypeValues
+		arExpCompTable(i) = elm
+		i = i + 1
+	Next
+
+	' Determine device capabilities
+	
+	ExposureModeAdjustable = Not dev.properties("Exposure Mode").IsReadOnly
+	If ExposureModeAdjustable And dev.properties("Exposure Mode").value <> 1 Then
+		spModeWarning.innerhtml = "<small><i>For full control select M mode and press Select Camera button!</i></small>"
+		
+		'mode is wrong, change to M mode, reconnect, then change but to original mode - this allows all features to be controlled
+		'originalMode = dev.properties("Exposure Mode").value 		
+		'dev.properties("Exposure Mode").value = 1
+		'originalDevice = dev.properties("Unique Device ID")
+		'devInited = 0
+		'Set dev = Nothing	
+	    'For Each elm In DevMan.deviceinfos '
+	    '	If elm.properties("Unique Device ID") = originalDevice Then
+		'		Set dev = elm.connect
+		'		Exit For
+	    '	End If
+	    'Next    
+		'SetUpExposureGUI
+		'dev.properties("Exposure Mode").value = originalMode 
+		'devInited = 1
+	Else
+		spModeWarning.innerhtml = ""
+	End If
+	'MsgBox "About to do SetUpExposureGUI"
+	SetUpExposureGUI
+	
+	fnRawJpgChange	' not really changed but it forces a push of the required value to the camera depending on the gui state at the moment
+	
+End Sub
+
+Sub fnExposureModeChange
+'	MsgBox (ddExposureMode.value)
+	dev.properties("Exposure Mode").value = ddExposureMode.value
+
+	SetUpExposureGUI
+
+End Sub
+
+sub fnSelectDevice
+	'Set dev = dlg.ShowSelectDevice( wiaCameraDeviceType)
+	if devInited = 1 Then
+		devInited = 0
+	 	Set dev = Nothing
+	End If
+	On Error Resume Next
+	Err.Clear
+	Set dev = dlg.ShowSelectDevice( wiaCameraDeviceType)
+	If Err.Number = 0 Then
+		DeviceSelected
+	End If
+	On Error Goto 0 
+End sub
+
+Function testCollection( obj, name)
+	Dim elm
+	testCollection = False
+	For Each elm In obj
+		If elm.name =name Then
+			testCollection = True
+		End If
+	Next
+
+End Function
+
+Sub PushExternalViewerChanged
+	If cbPushExternalViewer.checked Then
+		registrySaveSetting "pushexternalviewer", "on"
+	Else
+		registrySaveSetting "pushexternalviewer", "off"
+	End If
+
+End Sub
+
+Sub setRaw
+	if devInited = 1 Then		
+		If testCollection(dev.Properties, "Format") Then
+			on error resume next
+			dev.Properties("Format").Value = "{B96B3CA9-0728-11D3-9D7B-0000F81EF32E}"
+			on error goto 0
+			'msgbox "Shooting raw" , vbInformation 
+			imgFormat = "raw"
+			registrysavesetting "imgformat", imgformat
+		Else
+			MsgBox "This device does not support image formats", vbExclamation  
+		End If
+	'Else
+	'	MsgBox "Select device first", vbInformation
+	End If
+End Sub
+
+
+Sub setJpg
+	if devInited = 1 Then
+		If testCollection(dev.Properties, "Format") Then
+			on error resume next
+			dev.Properties("Format").Value = "{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}"
+			on error goto 0
+			'msgbox "Shooting JPG", vbInformation 
+			imgFormat = "jpg"
+			registrysavesetting "imgformat", imgformat	
+		Else
+			MsgBox "This device does not support image formats", vbExclamation  
+		End If			
+	'Else
+	'	MsgBox "Select device first", vbInformation
+	End If
+
+end sub
+
+Sub fnRawJpgChange
+  If rdRawjpg.value = "raw" Then
+  	setRaw
+  Else
+  	setJpg
+  End If	
+End Sub
+
+Sub Window_OnBeforeUnload
+
+	' get rid of the IE instance, but no error checking as it may already be gone
+	On Error Resume Next
+	
+	FullScreenPreviewWindow.Quit
+	Set FullScreenPreviewWindow = Nothing
+	
+End Sub
+
+Sub Window_Onload
+
+	Dim elm
+	Dim Cameras 
+	Dim LatestCameraID
+	Dim fldstr
+	Dim objreg
+	Dim savedpreviewsize, savedpushexternalviewer
+
+	FullScreenPreviewVisible = False
+
+    devInited = 0
+    Cameras = 0 
+	LatestCameraID = ""
+	imgFormat = "jpg"
+	ContinuousTether = 0
+	highestDownloadedItemNumber = 0 
+	tickno = 1
+	Pushtick = -10
+	BlockTether = False
+	currentPreview = ""
+	
+	' read from the registry the previous raw/jpg setting and defalut to jpg if there is no setting saved
+	imgformat = RegistryGetSetting("imgformat")
+	'MsgBox imgFormat
+	if imgformat ="" Then
+		imgFormat = "jpg"
+		registrysavesetting "imgformat", imgformat
+	end If
+	If devInited = 1 Then
+		if imgformat = "jpg" then
+			setjpg
+		end if
+		if imgformat = "raw" then
+			setraw
+		end If
+	End If
+
+
+
+	'update the gui to reflect the current value of raw/jpg
+	rdRawjpg.value = imgFormat
+		
+	
+	' StopContinuousTether 
+	StopTimeLapse
+		
+	Set dicShutterTable = CreateObject("Scripting.Dictionary") 
+	dicShutterTable.add 1,"6400"
+	dicShutterTable.add 2,"4000"
+	dicShutterTable.add 3,"3200"
+	dicShutterTable.add 4,"2500"
+	dicShutterTable.add 5,"2000"
+	dicShutterTable.add 6,"1600"
+	dicShutterTable.add 8,"1250"
+	dicShutterTable.add 10,"1000"
+	dicShutterTable.add 12,"800"
+	dicShutterTable.add 15,"640"
+	dicShutterTable.add 20,"500"
+	dicShutterTable.add 25,"400"
+	dicShutterTable.add 31,"320"
+	dicShutterTable.add 40,"250"
+	dicShutterTable.add 50,"200"
+	dicShutterTable.add 62,"160"
+	dicShutterTable.add 80,"125"
+	dicShutterTable.add 100,"100"
+	dicShutterTable.add 125,"80"
+	dicShutterTable.add 166,"60"
+	dicShutterTable.add 200,"50"
+	dicShutterTable.add 250,"40"
+	dicShutterTable.add 333,"30"
+	dicShutterTable.add 400,"25"
+	dicShutterTable.add 500,"20"
+	dicShutterTable.add 666,"15"
+	dicShutterTable.add 769,"13"
+	dicShutterTable.add 1000,"10"
+	dicShutterTable.add 1250,"8"
+	dicShutterTable.add 1666,"6"
+	dicShutterTable.add 2000,"5"
+	dicShutterTable.add 2500,"4"
+	dicShutterTable.add 3333,"3"
+	dicShutterTable.add 4000,"2.5"
+	dicShutterTable.add 5000,"2"
+	dicShutterTable.add 6250,"1.6"
+	dicShutterTable.add 7692,"1.3"
+	dicShutterTable.add 10000,"1s"
+	dicShutterTable.add 13000,"1.3s"
+	dicShutterTable.add 16000,"1.6s"
+	dicShutterTable.add 20000,"2s"
+	dicShutterTable.add 25000,"2.5s"
+	dicShutterTable.add 30000,"3s"
+	dicShutterTable.add 40000,"4s"
+	dicShutterTable.add 50000,"5s"
+	dicShutterTable.add 60000,"6s"
+	dicShutterTable.add 80000,"8s"
+	dicShutterTable.add 100000,"10s"
+	dicShutterTable.add 130000,"13s"
+	dicShutterTable.add 150000,"15s"
+	dicShutterTable.add 200000,"20s"
+	dicShutterTable.add 250000,"25s"
+	dicShutterTable.add 300000,"30s"	
+
+	' Set dicExpCompTable = CreateObject("Scripting.Dictionary") 
+
+	'	dicExpCompTable.add 0,"0"
+	' this is populated when the device is selected
+
+
+	
+	Set dicWBTable = CreateObject("Scripting.Dictionary") 
+	dicWBTable.Add 2, "Auto"
+	dicWBTable.Add 4, "Daylight"
+	dicWBTable.Add 5, "Fluorescent "
+	dicWBTable.Add 6, "Incandescent"
+	dicWBTable.Add 7, "Flash"
+	dicWBTable.Add 32784, "Cloudy"
+	dicWBTable.Add 32785, "Shade"
+	dicWBTable.Add 32786, "Kelvin"
+	dicWBTable.Add 32787, "Custom"
+	
+    Set DevMan = CreateObject("WIA.DeviceManager")
+    '
+    DevicesConnectedCount = DevMan.deviceinfos.count
+    For Each elm In DevMan.deviceinfos 
+    	If elm.type = wiaCameraDeviceType Then
+    		Cameras = Cameras + 1
+    		LatestCameraID = elm.DeviceID
+    	End If
+    Next
+    'MsgBox cameras
+    If Cameras = 1 Then
+	    For Each elm In DevMan.deviceinfos 
+	    	If elm.DeviceID = LatestCameraID Then
+				Set dev = elm.connect
+				'btSelectDevice.disabled = True
+				DeviceSelected
+	    	End If
+	    Next    
+    
+    End If
+    
+    If Cameras = 0 Then
+    	devicename.innerHTML = "<p> No cameras detected.  <a href=http://www.diyphotobits.com/set-camera-to-ptp-mode-not-usb-mode/ target=_blank>Ensure camera is in PTP mode, not USB mode</a>.</p>"
+    End If
+	If Cameras > 1 Then
+    	devicename.innerHTML = "<p> Multiple cameras connected, press button to select</p>"
+    End If
+    
+    
+    Set dlg  = CreateObject("WIA.CommonDialog")
+    
+ 	Set WshShell = CreateObject("WScript.Shell")
+	Set colEnvVars = WshShell.Environment("User")
+	tempfolder = WshShell.ExpandEnvironmentStrings("%TEMP%")
+	
+	Set fso= CreateObject("Scripting.FileSystemObject")   
+
+
+	outputfolder = RegistryGetSetting("outputfolder")
+	If outputfolder = "" Then
+		Set objReg = GetObject("winmgmts:\\localhost\root\default:StdRegProv")
+		objReg.GetStringValue &H80000001, "Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders", "My Pictures", outputfolder
+		
+		outputfolder  = outputfolder + "\"
+	
+		foldername = Left(outputfolder,Len(outputfolder)-1)
+		foldername = Mid(foldername, 1+InStrRev(foldername,"\")) 
+		
+		If not fso.FolderExists(outputfolder) Then
+		   fso.CreateFolder(outputfolder )
+		End If
+		
+		txtFolder.innerHTML = "Output folder: <a href=""" + outputfolder + """>"+outputfolder+"</a>"
+		 
+		RegistrySaveSetting "outputfolder", outputfolder 
+	End If
+
+	' this value is used for the push external viewer to identify which window to send keystrokes to
+	foldername = Left(outputfolder,Len(outputfolder)-1)
+	foldername = Mid(foldername, 1+InStrRev(foldername,"\")) 
+
+	'MsgBox outputfolder
+	txtFolder.innerHTML = "Output folder: <a href=""" + outputfolder + """>"+outputfolder+"</a>"
+
+	
+	savedpreviewsize = RegistryGetSetting("previewsize")
+'	MsgBox savedpreviewsize
+	If savedpreviewsize = "" Then
+		' MsgBox "No value for preview size, setting 10%"
+		savedpreviewsize = "10%"	
+		
+	End If
+	'MsgBox savedpreviewsize
+	ddPreviewSize.value = savedpreviewsize
+	registrySaveSetting "previewsize", ddpreviewSize.value
+	
+	' read from the registry the previous value of savedpushexternalviewer
+	savedpushexternalviewer = RegistryGetSetting("pushexternalviewer")
+	If savedpushexternalviewer = "" Then
+		savedpushexternalviewer = "off"
+	End If
+	
+	If savedpushexternalviewer = "on" Then 
+		cbPushExternalViewer.checked = True
+	Else 
+	cbPushExternalViewer.checked = False
+	End If
+	registrySaveSetting "pushexternalviewer", savedpushexternalviewer
+		
+	' load pp settings
+	PostProcessingCommand.value = RegistryGetSetting("postprocessingcommand")
+	slWindowType.value = RegistryGetSetting("ppwindowtype")
+	slWait.value = RegistryGetSetting("ppwait")
+	
+	
+
+	'SetUpExposureGUI
+	'spAperture.disabled = true
+	'spExposureTime.disabled = True 
+
+	If RegistryGetSetting("tethering") = "on" Then
+		'MsgBox "tethere was set to on in the registry to starting it now"
+		StartContinuousTether		
+		If devInited = 0 Then 
+			btStartContinuousTether.disabled = True
+			btStopContinuousTether.disabled = False
+		End If
+	Else		
+		StopContinuousTether
+	End If
+
+
+	' start the background process
+
+
+	timerID = window.setInterval("tickProcess", tickSize)
+	
+End Sub
+
+Sub fnSelectFolder
+
+	outputfolder = PickFolder(outputfolder)
+	RegistrySaveSetting "outputfolder", outputfolder 
+	foldername = Left(outputfolder,Len(outputfolder)-1)
+	foldername = Mid(foldername, 1+InStrRev(foldername,"\")) 
+	'MsgBox outputfolder +"-=-" + foldername
+	If not fso.FolderExists(outputfolder) Then
+	   fso.CreateFolder(outputfolder )
+	End If
+'	If not fso.FolderExists(outputfolder & "temp\")  Then'
+'	   fso.CreateFolder(outputfolder & "temp\") 
+'	End If
+	
+	txtFolder.innerHTML = "Output folder: <a href=""" + outputfolder + """>"+outputfolder+"</a>"
+
+End Sub
+
+Sub StartContinuousTether
+	if devInited = 1 Then
+		ContinuousTether = 1
+		highestDownloadedItemNumber = dev.Items.Count
+		'timerID = window.setInterval("tickProcess", 500)
+		btStartContinuousTether.disabled = True
+		btStopContinuousTether.disabled = False
+'		cbDownloadImmediatelySaved =	cbDownloadImmediately.checked
+'		cbDownloadImmediately.checked = True
+'		cbDownloadImmediately.disabled = True
+	End If 
+	registrySaveSetting "tethering", "on"
+End Sub
+
+
+Sub StopContinuousTether
+	ContinuousTether = 0
+	'window.clearInterval(timerID)
+	btStartContinuousTether.disabled = False
+	btStopContinuousTether.disabled = True
+'	cbDownloadImmediately.disabled = False
+'	cbDownloadImmediately.checked = cbDownloadImmediatelySaved
+	registrySaveSetting "tethering", "off"
+End Sub
+
+Sub checkAndCreateFullScreenPreview
+	' strangely it is hard to tell if the dialog has been closed by the user, so each
+	' time we want to use it we need to check that it is there and create it if needed
+Dim blobstatus
+Dim poperr
+	Err.Clear
+	On Error Resume Next
+	blobstatus = FullScreenPreviewDIV.innerhtml
+	'MsgBox blobstatus
+	PopErr = Err.Number
+	On Error Goto 0
+	If PopErr <> 0 Then	
+		Set FullScreenPreviewDIV = Nothing	
+		Set FullScreenPreviewWindow = Nothing
+		Set FullScreenPreviewWindow = showModelessDialog("about:blank","","dialogLeft:0;dialogTop:0;scroll:no;dialogWidth:"+CStr(screen.width)+"px;dialogHeight:"+CStr(screen.height)+"px")
+		FullScreenPreviewWindow.document.write "<title>  Drag this window aside to reveal controls  </title><div id=""blob""> &nbsp; </div>"
+		Set FullScreenPreviewDIV = FullScreenPreviewWindow.document.getElementById("blob")
+	End If
+
+End Sub
+
+Sub OnOpenFullScreenPreview
+	If 	FullScreenPreviewVisible = True Then	
+		FullScreenPreviewVisible = False
+		Set FullScreenPreviewDIV = Nothing
+		FullScreenPreviewWindow.close
+		If currentPreview <> "" Then
+			updatePreview(currentPreview)
+		End if
+		
+	Else
+		'MsgBox "Use ALT-Tab to switch or Alt-F4 to close full screen preview"
+		FullScreenPreviewVisible = true
+		checkAndCreateFullScreenPreview
+		previewImg.innerHTML = "Preview in full screen window"
+		If currentPreview <> "" Then
+		 	FullScreenPreviewDIV.innerhtml = "<img src="""+currentPreview+""" width="""+CStr(screen.width)+"px"" height="""+CStr(screen.height)+"px"" >"
+		End If
+	End If
+End Sub
+
+
+Sub updatePreview(fn)
+
+  	If FullScreenPreviewVisible Then
+	  	checkAndCreateFullScreenPreview
+  		FullScreenPreviewDIV.innerhtml = "<img src="""+fn+""" width="""+CStr(screen.width)+"px"" height="""+CStr(screen.height)+"px"" >"
+  		previewImg.innerHTML = "Preview in full screen window"
+  	Else
+	 	If Right(UCase(fn),3) <> "JPG" Then
+			previewImg.innerHTML = "No preview for raw. <a href=""http://www.diyphotobits.com/cc-help-why-no-preview-for-raw/""><i> Why not? </i></a>"
+		Else
+	  		previewImg.innerHTML = "<a target=_preview href=""" + fn + _
+	  			"""><IMG src=""" + fn + """ width=""" + ddPreviewSize.value + _
+	  			""" /><br> <font size=1>"+fn+"</font> </a>"
+	  		'MsgBox previewtd.width
+	  	End If 	
+  	End If
+  	currentPreview = fn
+End Sub
+
+Sub PreviewChangeSize
+	updatePreview(currentPreview)
+	registrySaveSetting "previewsize", ddPreviewSize.value 
+End Sub
+
+
+Sub slFileListChanged
+	Dim previewFileName
+	'MsgBox(slFileList.value)
+	previewFileName = slFileList.value
+	'MsgBox imgFormat
+	updatePreview(previewFileName)
+
+End Sub
+
+
+Sub tickProcess
+	Dim downloadedfilename
+	Dim i 
+	Dim ret
+	
+	tickno = tickno + 1
+	'tickdisplay.innerhtml = tickno
+	'tickdisplay.innerhtml = DevMan.deviceinfos.count
+	If DevMan.deviceinfos.count <> DevicesConnectedCount then
+		' device connected or disconnected, should allow reselection
+		btSelectDevice.disabled = false
+		'msgbox "Lost device "&DevicesConnectedCount
+		DevicesConnectedCount = DevMan.deviceinfos.count
+	End If
+	If devInited = 1 Then
+		If ContinuousTether = 1 Then
+			If Not BlockTether Then 
+				While 	highestDownloadedItemNumber < dev.Items.Count
+					downloadedfilename = downloadOne(highestDownloadedItemNumber + 1)
+					'MsgBox imgFormat
+					'MsgBox downloadedfilename
+					' only update the preview if we have something worth showing
+					If right(LCase(downloadedfilename),3) = "jpg" Then 
+						updatePreview(downloadedfilename)
+						' update which one is highlighted
+						slFileList.selectedIndex = slFileList.length - 1
+					End If
+			   		If cbPushExternalViewer.checked Then			
+						Pushtick = tickno + (1000 / tickSize)
+					End If	
+				Wend	
+			End If
+		End If	
+	
+		If tickno = Pushtick Then
+			'MsgBox "activate"
+			'MsgBox foldername
+			ret = WshShell.AppActivate( foldername, 1000 )
+		'	MsgBox ret
+			If ret = False then
+				' no such window or window is busy so don't try to send keys
+				Pushtick = 0
+			End If
+		End If
+		If tickno = Pushtick+1 Then
+			'MsgBox "right"
+			WshShell.SendKeys "{RIGHT}"	
+		End If
+		If tickno = Pushtick+2 Then
+			'MsgBox "end"
+			WshShell.SendKeys "{END}"
+			Pushtick = -1
+		End If
+		
+		
+		If testCollection(dev.Properties, "Battery Status") Then
+			spCameraBatteryStatus.innerHTML = dev.Properties( "Battery Status") 
+			If (spCameraBatteryStatus.innerHTML = "[object]") Then
+				spCameraBatteryStatus.innerHTML = "No connection"		
+		
+			End If
+		End If
+		
+		If TimelapseActive Then
+			If tickno >= nextTimeLapseShot Then
+				' in 5.1 dev changed this calculation to BEFORE the shutterrelease so that the delay 
+				' between TL shots will be more accurate as the next time is being
+				' calculated from before rather than after this bunch of shots as
+				' shooting a bunch may take several seconds
+				nextTimeLapseShot = tickno + (CInt(tbFrequencyInSeconds.value) * (1000 / tickSize))
+				
+				For i = 1 To CInt(tbShots.value) 
+					fnShutterRelease
+					TimeLapseShots = TimeLapseShots  + 1
+				Next				
+				spTimeLapseShots.innertext = TimeLapseShots
+
+			End If
+			' MsgBox TimeLapseShots , tbTotalShots.value
+			If TimeLapseShots >= Clng(tbTotalShots.value) Then
+				StopTimeLapse
+			End If
+		End If
+		
+	End If ' devInited = 1 
+		
+End Sub
+
+Function PickFolder(strStartDir)
+	Dim SA, F
+	Dim fldrname
+	
+	PickFolder = strStartDir
+	On Error Resume next
+	Set SA = CreateObject("Shell.Application")
+	Set F = SA.BrowseForFolder(0, "Choose a folder", &H8000 + &H40 + &H10, 0)
+	If (Not F Is Nothing) Then
+	  	fldrname = F.Items.Item.Path
+	 Else
+	 	fldrname = strStartDir
+	End If
+	On Error Goto 0
+	
+	If Right(fldrname,1) <> "\" Then
+		fldrname = fldrname + "\"
+	End If
+	
+	PickFolder = fldrname
+	Set F = Nothing
+	Set SA = Nothing
+End Function 
+
+
+
+Sub OnClickButtonMarkImage()
+Dim OldValue, NewValue
+Dim OldText, NewText  
+
+	OldValue = slFileList.item(slFileList.selectedIndex).value ' full path
+	OldText = slFileList.item(slFileList.selectedIndex).text ' just the file name, in lower case
+	
+	NewValue = Left(slFileList.item(slFileList.selectedIndex).value, len(outputfolder)) + "-" + Mid(slFileList.item(slFileList.selectedIndex).value, len(outputfolder)+1,999)
+	NewText = "-" + slFileList.item(slFileList.selectedIndex).text
+	
+	fso.MoveFile OldValue, NewValue
+	
+	slFileList.item(slFileList.selectedIndex).value = NewValue
+	slFileList.item(slFileList.selectedIndex).text = NewText
+	updatePreview (NewValue)
+End Sub
+
+Sub OnClickButtonUnMarkImage()
+Dim OldValue, NewValue
+Dim OldText, NewText  
+
+	OldValue = slFileList.item(slFileList.selectedIndex).value ' full path
+	OldText = slFileList.item(slFileList.selectedIndex).text ' just the file name, in lower case
+	'MsgBox OldText
+	'check if this is marked
+	If Left(OldText,1) = "-" Then
+		NewValue = outputfolder +  Mid(OldValue, Len(outputfolder)+2,999)
+		NewText = Mid(OldText,2,999)
+		
+		fso.MoveFile OldValue, NewValue
+		
+		slFileList.item(slFileList.selectedIndex).value = NewValue
+		slFileList.item(slFileList.selectedIndex).text = NewText
+	End If	  
+	updatePreview (NewValue)
+End Sub
+
+Sub OnClickButtonPostProcessImage()
+	Dim ReturnValue
+	ReturnValue = 0
+	ReturnValue = DoPostProcessing(slFileList.item(slFileList.selectedIndex).value)
+	If ReturnValue > 0 Then
+		MsgBox "Post processing error: " +CStr(ReturnValue)
+	End If
+	' Just in case the PP did something to the jpg
+	updatePreview (slFileList.item(slFileList.selectedIndex).value)
+End Sub
+
+Function DoPostProcessing(fn)
+	'MsgBox PostProcessingCommand.value + " " + Chr(34) + fn + chr(34)
+	DoPostProcessing = WshShell.Run (PostProcessingCommand.value + " " + Chr(34) + fn + chr(34), slWindowType.value, slWait.value = "Yes")
+End Function
+
+Sub OnChangePostProcessingCommand
+	RegistrySaveSetting "postprocessingcommand", postProcessingcommand.value
+End Sub
+
+Sub OnChangeslWindowType
+	RegistrySaveSetting "ppwindowtype", slWindowType.value
+End Sub
+
+Sub OnChangeslWait
+	RegistrySaveSetting "ppwait", slWait.value
+End Sub
+
+
+</script>
+<body>
+<div id="container">
+	<div id="masthead">
+		<h1 >
+		<a href="http://www.diyphotobits.com/?cchd">DIYPhotoBits.com</a></h1>
+		<br>
+		<h2 align="center">Camera Control 5.1 dev</h2>
+		<br>
+		<br>
+	</div>
+</div>
+<br>
+<br>
+<br>
+	<table width = "100%" >
+		<tr>
+			<td width="195" VALIGN =top colspan=2>
+				<H3> Configuration </h3>
+			</td>
+		</tr>
+		<tr>
+			<td height="55" width="195" VALIGN =top>
+				<input name="btSelectDevice" class="button" type="button" value="Select Camera"  onClick="fnSelectDevice"> 
+				<input name="btSetFolder" class="button" type="button" value="Select Folder"  onClick="fnSelectFolder"><br>
+			</td>			
+			<td height="55" VALIGN =top>
+				<span id="devicename">No camera selected</span><br>
+				<span id="txtFolder">Output folder default: <a href="#">#</a></span><div>File name prefix: <input type="text" name="txtFileNamePrefix" id="txtFileNamePrefix"> <a href="http://www.diyphotobits.com/cc-help-file-name-prefix/"><i>Help?</i></a></div>
+			</td>
+		</tr>
+		<tr>
+			<td colspan=2>
+			<hr>
+			</td>
+		</tr>
+		<tr>
+			<td  width="195" VALIGN =top colspan=2>
+				<H3> Controls </h3>
+			</td>
+		</tr>
+		<tr>
+			<td height="51" width="195">
+			</td>
+			<td height="51" >
+				<span id=spExposureMode>Exposure mode: <select id=slExposureMode></select> </span>	&nbsp&nbsp
+				<span id=spExposureTime>Shutter: <select id=slExposureTime></select></span>&nbsp&nbsp
+				<span id=spAperture>Aperture: <select id=slAperture></select></span> &nbsp&nbsp
+				<span id=spModeWarning></span>	<br>	
+				<span id=spExposureISO>ISO: <select id=slExposureISO></select></span>	<br>
+				<span id=spExposureCompensation>Exposure Compensation: <select id=slExposureCompensation></select></span> &nbsp&nbsp
+				<span id=spWhiteBalance>White Balance: <select id=slWhiteBalance></select></span>		<br>
+				Battery Status: <span id=spCameraBatteryStatus></span>	
+			</td>
+		</tr>
+		<tr>
+			<td colspan=2>
+			<hr>
+			</td>
+		</tr>
+		<tr>
+			<td height="193" width="195" VALIGN =top >
+				<fieldset>
+					<input type="button" value="Shutter Release" name="btSR1" onclick="fnShutterRelease">
+					<br>
+					File type
+					<select size=1 id=rdRawjpg onchange=fnRawJpgChange name=ddRawJpg>
+						<option value="raw">Raw</option>
+						<option value="jpg" selected>JPG</option>
+					</select>
+					<br>
+					<a href="http://www.diyphotobits.com/cc-help-shutter-release-raw-jpg/"><i>Help?</i></a>
+				</fieldset>
+				<br><br>
+				<fieldset>
+					<input type="button" value="Start tether" name="btStartContinuousTether" onclick="StartContinuousTether"><br>
+					<input type="button" value="Stop tether" name="btStopContinuousTether" onclick="StopContinuousTether"><br>
+					<a href="http://www.diyphotobits.com/cc-help-start-stop-tether/"><i>Help?</i></a><br><br>
+					<input type="checkbox" onchange="PushExternalViewerChanged" name="cbPushExternalViewer"> Push external viewer to display the latest image <a href="http://www.diyphotobits.com/cc-help-push-external-viewer/"><i>Help?</i></a><br>
+				</fieldset>
+			</td>
+			<td>
+				<table>
+					<tr>
+						<td valign="top">
+							<span id="filelist">
+								<select id="slFileList" size=20 onchange=slFileListChanged>
+								</select>
+							</span>
+						</td>
+						<td id="previewtd" width=50% valign="top">
+							Preview size: <select size="1" onchange="PreviewChangeSize" name="ddPreviewSize" >
+										    <option value="150">150 px</option>
+										    <option value="300">300 px</option>
+										    <option value="600">600 px</option>
+											<option value="1200">1200 px</option>
+											<option value="10%">10%</option>
+											<option value="20%">20%</option>
+											<option value="50%">50%</option>
+											<option value="100%">100%</option>
+										</select>
+							<div id="previewImg" style="border:1"><i>Preview image will appear here</i></div><br>
+							<input type="button" name="MarkImage" id="MarkImage" value="Mark" onclick="OnClickButtonMarkImage">
+							<input type="button" name="UnMarkImage" id="UnMarkImage" value="Unmark" onclick="OnClickButtonUnMarkImage"><a href="http://www.diyphotobits.com/cc-help-markunmark-image/"><i>Help?</i></a><br><br>
+							<input type="button" name="btPostProcessImage" id="btPostProcessImage" value="Post Process" onclick="OnClickButtonPostProcessImage"><a href="http://www.diyphotobits.com/cc-help-post-processing-commands/"><i>Help?</i></a><br><br>
+							<input type="button" name="btOpenFullScreenPreview" id="btOpenFullScreenPreview" value="Full Screen Preview" onclick="OnOpenFullScreenPreview"><a href="http://www.diyphotobits.com/cc-help-full-screen-preview/"><i>Help?</i></a>
+						</td>
+					</tr>
+				</table>
+			</td>
+		</tr>
+		<tr>
+			<td colspan=2>
+			<hr>
+			</td>
+		</tr>		
+		<tr>
+			<td colspan=2>
+			<h3>Time lapse</h3>
+			<p><input type="button" value="Start Time Lapse" name="btStartTimeLapse" onclick="StartTimeLapse"></p>
+			<p><input type="button" value="Stop Time Lapse" name="btStopTimeLapse" onclick="StopTimeLapse"></p>
+			<fieldset>
+				<p>Frequency (seconds) <input style="width: 20px"  type="text" name="tbFrequencyInSeconds" size="3" value="5"> &nbsp;&nbsp;
+				 Shots each time &nbsp<input style="width: 20px" type="text" name="tbShots" size="2" value="1"> &nbsp;&nbsp;
+				 Total shots to take &nbsp<input style="width: 40px" type="text" name="tbTotalShots" size="5" value="9999"> &nbsp;&nbsp;
+				 Delay before starting &nbsp<input style="width: 40px" type="text" name="tbDelayBeforeStarting" size="7" value="0"></p>
+				 <!--Rename files &nbsp <input type="checkbox" name="cbTimeLapseRename"><br>-->
+				<p>
+			</fieldset> 
+			<p>Shots taken: <span id=spTimeLapseShots>0</span></p>
+			<i><a href="http://www.diyphotobits.com/2010/01/23/how-many-shutter-actuations-can-your-dslr-survive/">Read these thoughts about time lapse and your shutter life before starting!</a></i>
+			<hr>
+			</td>
+		</tr>		
+		<tr>
+			<td colspan=2>
+			<h3>Bracketing</h3>
+			<fieldset>
+				<input type="checkbox" name="cbBracket"> Enable bracketing<br>
+				Shots: <input style="width: 20px"  type="text" name="tbBracketShots" size="3" value="2"> &nbsp;&nbsp;
+				Stops: <input style="width: 20px"  type="text" name="tbBracketStops" size="3" value="1"> &nbsp;&nbsp;			
+				<a href="http://www.diyphotobits.com/cc-help-bracketing/"><i>Help?</i></a>
+			</fieldset> 
+			<hr>
+			</td>
+		</tr>
+		<tr>
+			<td colspan=2>
+			<h3>Post processing command</h3>
+				<input type="checkbox" name="cbPostProcess" id="cbPostProcess"> Enable Auto Post processing command <br>
+				Posting Processing command <input type="text" onchange="OnChangePostProcessingCommand" name="PostProcessingCommand" id="PostProcessingCommand">
+				<select name="slWindowType" onchange="OnChangeslWindowType" id="slWindowType">
+				  <option value="0">Hidden</option>
+				  <option value="3">Maximized</option>
+				  <option value="2">Minimzed</option>
+				  <option value="1" selected>Normal</option>
+				</select>&nbsp;&nbsp;&nbsp;&nbsp;
+				Wait? <select name="slWait" onchange="OnChangeslWait" id="slWait">
+				  <option value="Yes" selected>Yes</option>
+				  <option value="No">No</option>
+				</select>
+				<a href="http://www.diyphotobits.com/cc-help-post-processing-commands/"><i>Help?</i></a>
+			<hr>
+			</td>
+		</tr>	
+	</table>
+	<br>
+	<br>
+	<br>
+<span>
+	<hr>
+	<h2>Blog updates</h2><br>
+	<script src="http://feeds.feedburner.com/Diyphotobitscom?format=sigpro" type="text/javascript" ></script><noscript><p>Subscribe to RSS headline updates from: <a href="http://feeds.feedburner.com/Diyphotobitscom"></a><br/>Powered by FeedBurner</p> </noscript>
+	<hr>
+	<address align="center">
+		Copyright Raymond Lowe 2008-2010 - All Rights Reserved - Free for non-commercial use - <a href="http://www.diyphotobits.com/?ccsg">http://www.diyphotobits.com</a>
+	</address>
+	</span>
+
+</body>
+</html>
